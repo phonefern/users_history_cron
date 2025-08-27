@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: migration-service
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: SUPABASE_HOST
+        value: aws-0-ap-southeast-1.pooler.supabase.com
+      - key: SUPABASE_PORT
+        value: "6543"
+      - key: SUPABASE_DB
+        value: postgres
+      - key: SUPABASE_USER
+        value: postgres.mieiwzfhohifeprjtnek
+      - key: SUPABASE_PASSWORD
+        sync: false  # Set this in Render dashboard as secret
+      - key: FIREBASE_CREDS
+        sync: false  # Set this in Render dashboard as secret
+    healthCheckPath: /health
