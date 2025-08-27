@@ -1,7 +1,14 @@
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
-import psycopg2
+try:
+    import psycopg2
+    import psycopg2.extensions
+    PSYCOPG_VERSION = 2
+except ImportError:
+    import psycopg as psycopg2
+    import psycopg
+    PSYCOPG_VERSION = 3
 import os
 from dotenv import load_dotenv
 import time
@@ -90,9 +97,10 @@ def initialize_firebase() -> firestore.client:
         logger.critical(f"Firebase initialization failed: {str(e)}")
         raise
 
-def get_db_connection(connection_purpose: Optional[str] = None) -> psycopg2.extensions.connection:
+def get_db_connection(connection_purpose: Optional[str] = None):
     """
     Establishes a connection to the Supabase PostgreSQL database.
+    Compatible with both psycopg2 and psycopg3.
     """
     conn_params = {
         'host': os.getenv("SUPABASE_HOST", "aws-0-ap-southeast-1.pooler.supabase.com"),
@@ -105,14 +113,20 @@ def get_db_connection(connection_purpose: Optional[str] = None) -> psycopg2.exte
     
     try:
         start_time = time.time()
-        conn = psycopg2.connect(**conn_params)
+        
+        if PSYCOPG_VERSION == 3:
+            # psycopg3 syntax
+            conn = psycopg2.connect(**conn_params)
+        else:
+            # psycopg2 syntax
+            conn = psycopg2.connect(**conn_params)
         
         with conn.cursor() as cur:
             cur.execute("SELECT pg_backend_pid() AS pid, current_database()")
             db_info = cur.fetchone()
         
         logger.info(
-            f"DB connection established | PID: {db_info[0]} | DB: {db_info[1]} | "
+            f"DB connection established (psycopg{PSYCOPG_VERSION}) | PID: {db_info[0]} | DB: {db_info[1]} | "
             f"Time: {round((time.time() - start_time) * 1000, 2)}ms"
         )
         return conn
@@ -380,7 +394,8 @@ def run_migration_job(collections: List[str], full_sync: bool = False, dry_run: 
             'collections': results,
             'since_date': since_date.isoformat() if since_date else None,
             'full_sync': full_sync,
-            'dry_run': dry_run
+            'dry_run': dry_run,
+            'psycopg_version': PSYCOPG_VERSION
         }
         
     except Exception as e:
@@ -388,7 +403,8 @@ def run_migration_job(collections: List[str], full_sync: bool = False, dry_run: 
         return {
             'success': False,
             'error': str(e),
-            'duration': time.time() - start_time
+            'duration': time.time() - start_time,
+            'psycopg_version': PSYCOPG_VERSION
         }
 
 # Flask Routes
@@ -407,26 +423,21 @@ def health_check():
             'services': {
                 'database': 'connected',
                 'firebase': 'initialized' if firebase_initialized else 'not_initialized'
-            }
+            },
+            'psycopg_version': PSYCOPG_VERSION
         }), 200
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',
             'error': str(e),
-            'timestamp': datetime.now(pytz.UTC).isoformat()
+            'timestamp': datetime.now(pytz.UTC).isoformat(),
+            'psycopg_version': PSYCOPG_VERSION
         }), 500
 
 @app.route('/migrate', methods=['POST'])
 def trigger_migration():
     """
     Trigger migration via HTTP POST request
-    Expected JSON payload:
-    {
-        "collections": ["users", "temps"],  // optional, defaults to all
-        "full_sync": false,                 // optional, defaults to false
-        "dry_run": false,                   // optional, defaults to false
-        "async": false                      // optional, run in background
-    }
     """
     try:
         data = request.get_json() or {}
@@ -462,7 +473,8 @@ def trigger_migration():
                 'message': 'Migration started in background',
                 'collections': collections,
                 'full_sync': full_sync,
-                'dry_run': dry_run
+                'dry_run': dry_run,
+                'psycopg_version': PSYCOPG_VERSION
             }), 202
         else:
             # Run synchronously
@@ -477,7 +489,8 @@ def trigger_migration():
         logger.error(f"API error: {str(e)}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'psycopg_version': PSYCOPG_VERSION
         }), 500
 
 @app.route('/migrate/status', methods=['GET'])
@@ -492,13 +505,15 @@ def migration_status():
             'current_time': datetime.now(BANGKOK_TZ).isoformat(),
             'current_time_utc': datetime.now(pytz.UTC).isoformat(),
             'timezone': 'Asia/Bangkok',
-            'available_collections': COLLECTIONS_TO_MIGRATE
+            'available_collections': COLLECTIONS_TO_MIGRATE,
+            'psycopg_version': PSYCOPG_VERSION
         }), 200
         
     except Exception as e:
         logger.error(f"Status check failed: {str(e)}", exc_info=True)
         return jsonify({
-            'error': str(e)
+            'error': str(e),
+            'psycopg_version': PSYCOPG_VERSION
         }), 500
 
 @app.route('/', methods=['GET'])
@@ -507,6 +522,7 @@ def index():
     return jsonify({
         'service': 'Firestore to Supabase Migration Service',
         'version': '1.0.0',
+        'psycopg_version': PSYCOPG_VERSION,
         'endpoints': {
             'GET /health': 'Health check',
             'GET /migrate/status': 'Get migration status',
@@ -524,7 +540,7 @@ if __name__ == '__main__':
     # Initialize Firebase on startup
     try:
         initialize_firebase()
-        logger.info("Service initialized successfully")
+        logger.info(f"Service initialized successfully with psycopg{PSYCOPG_VERSION}")
     except Exception as e:
         logger.error(f"Service initialization failed: {str(e)}")
     
