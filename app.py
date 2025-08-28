@@ -201,19 +201,15 @@ def migrate_all_to_users_history(
     dry_run: bool = False
 ) -> Tuple[int, int]:
     """
-    Migrates records from Firestore to Supabase users_history table based on collection selection.
-
-    Changes:
-        - When using `since`, only filter by `timestamp`
-        - `lastUpdate` is stored but no longer used for filtering or sorting
-
+    Migrates records from Firestore to Supabase users_history table using batch processing.
+    
     Args:
         collection: The Firestore collection to migrate ('users' or 'temps')
-        since: Only migrate records with timestamp newer than this datetime
+        since: Only migrate records newer than this datetime (checks only 'timestamp' now)
         full_sync: Migrate all records regardless of timestamp
-        page_size: Number of user documents to process at once
+        page_size: Number of user documents to process per batch
         dry_run: If True, only count records without inserting
-
+        
     Returns:
         Tuple of (total_records_processed, records_migrated)
     """
@@ -224,6 +220,7 @@ def migrate_all_to_users_history(
     fs_db = initialize_firebase()
     total_processed = 0
     total_migrated = 0
+    batch_count = 0
 
     try:
         conn = get_db_connection("migration to users_history")
@@ -231,92 +228,99 @@ def migrate_all_to_users_history(
 
         logger.info(f"Starting migration for collection: {collection}")
 
+        # Setup Firestore reference
         users_ref = fs_db.collection(collection)
-        user_docs = list(users_ref.stream())
+        last_doc = None
 
-        for user_doc in user_docs:
-            user_id = user_doc.id
-            records_ref = fs_db.collection(collection).document(user_id).collection("records")
+        while True:
+            # Fetch next batch of users
+            query = users_ref.limit(page_size)
+            if last_doc:
+                query = query.start_after(last_doc)
 
-            # Always fetch all records, filtering happens in Python
-            records_query = records_ref
-            user_records = list(records_query.stream())
+            user_docs = list(query.stream())
+            if not user_docs:
+                break
 
-            # Filter by timestamp if since is provided and full_sync is False
-            if since and not full_sync:
-                filtered_records = []
+            logger.info(f"Processing batch {batch_count + 1} ({len(user_docs)} users)...")
+
+            for user_doc in user_docs:
+                user_id = user_doc.id
+                records_ref = fs_db.collection(collection).document(user_id).collection("records")
+                user_records = list(records_ref.stream())
+
+                # Filter records by since if provided (now we only check timestamp)
+                if since and not full_sync:
+                    user_records = [
+                        rec for rec in user_records
+                        if (ts := parse_ts(rec.to_dict().get("timestamp"))) and ts > since
+                    ]
+
+                total_processed += len(user_records)
+                if not user_records:
+                    continue
+
+                # Group records by recorder
+                grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
                 for rec in user_records:
                     data = rec.to_dict()
-                    timestamp_ts = parse_ts(data.get("timestamp"))
+                    recorder = data.get("recorder") or "unknown"
+                    timestamp_ts = parse_ts(data.get("timestamp")) or datetime.min.replace(tzinfo=pytz.UTC)
+                    grouped_records.setdefault(recorder, []).append((timestamp_ts, rec.id, data))
 
-                    # Only check timestamp, ignore lastUpdate completely
-                    if timestamp_ts and timestamp_ts > since:
-                        filtered_records.append(rec)
-                user_records = filtered_records
+                # Insert into database
+                for recorder, rec_list in grouped_records.items():
+                    for timestamp_ts, rec_id, data in rec_list:
+                        try:
+                            version = data.get("version")
+                            prediction = data.get("prediction", {})
+                            risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
+                            prediction_risk_for_db = str(risk_val) if risk_val is not None else None
 
-            total_processed += len(user_records)
-            if not user_records:
-                continue
+                            counts = {
+                                field: 1 if data.get(field) is not None else 0
+                                for field in FIELDS_TO_COUNT
+                            }
 
-            # Group records by recorder (no need to sort by lastUpdate anymore)
-            grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
-            for rec in user_records:
-                data = rec.to_dict()
-                recorder = data.get("recorder") or "unknown"
+                            if not dry_run:
+                                fields = ', '.join(FIELDS_TO_COUNT)
+                                placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
+                                all_values = [
+                                    user_id,
+                                    recorder,
+                                    rec_id,
+                                    version,
+                                    timestamp_ts,
+                                    prediction_risk_for_db
+                                ] + [counts[f] for f in FIELDS_TO_COUNT]
 
-                # Use timestamp only; fallback to datetime.min if missing
-                timestamp_ts = parse_ts(data.get("timestamp"))
-                effective_timestamp = timestamp_ts or datetime.min.replace(tzinfo=pytz.UTC)
+                                cur.execute(f"""
+                                    INSERT INTO users_history (
+                                        user_id, recorder, record_id, version, last_update,
+                                        prediction_risk, {fields}
+                                    ) VALUES ({placeholders})
+                                    ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
+                                """, all_values)
 
-                grouped_records.setdefault(recorder, []).append((effective_timestamp, rec.id, data))
+                                total_migrated += 1
 
-            # Process each recorder's records
-            for recorder, rec_list in grouped_records.items():
-                for effective_timestamp, rec_id, data in rec_list:
-                    try:
-                        version = data.get("version")
-                        prediction = data.get("prediction", {})
-                        risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
-                        prediction_risk_for_db = str(risk_val) if risk_val is not None else None
+                                # Commit every 500 records
+                                if total_migrated % 500 == 0:
+                                    conn.commit()
+                                    logger.info(f"Committed {total_migrated} records so far...")
 
-                        # Store lastUpdate in DB, but ignore it for filtering
-                        last_update_ts = parse_ts(data.get("lastUpdate"))
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
+                                exc_info=True
+                            )
+                            conn.rollback()
 
-                        counts = {
-                            field: 1 if data.get(field) is not None else 0
-                            for field in FIELDS_TO_COUNT
-                        }
-
-                        if not dry_run:
-                            fields = ', '.join(FIELDS_TO_COUNT)
-                            placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
-
-                            base_values = [user_id, recorder, rec_id, version, effective_timestamp, prediction_risk_for_db]
-                            field_values = [counts[f] for f in FIELDS_TO_COUNT]
-                            all_values = base_values + field_values
-
-                            if len(all_values) != (6 + len(FIELDS_TO_COUNT)):
-                                raise ValueError(f"Value count mismatch: {len(all_values)} vs {6 + len(FIELDS_TO_COUNT)}")
-
-                            cur.execute(f"""
-                                INSERT INTO users_history (
-                                    user_id, recorder, record_id, version, last_update,
-                                    prediction_risk, {fields}
-                                ) VALUES ({placeholders})
-                                ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
-                            """, all_values)
-
-                            total_migrated += 1
-                            if total_migrated % 10 == 0:
-                                conn.commit()
-                                logger.info(f"Migrated {total_migrated} records...")
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
-                            exc_info=True
-                        )
-                        conn.rollback()
+            # Update last_doc for pagination
+            last_doc = user_docs[-1]
+            batch_count += 1
+            conn.commit()
+            logger.info(f"Batch {batch_count} completed. Total migrated: {total_migrated}")
 
         logger.info(f"Finished processing {collection} collection")
 
@@ -339,6 +343,8 @@ def migrate_all_to_users_history(
             cur.close()
         if 'conn' in locals():
             conn.close()
+
+
 
             
 def parse_args():
@@ -585,94 +591,43 @@ def index() -> Response:
     return Response(html, mimetype="text/html")
 
 
-@app.route("/migrate", methods=["GET", "POST"])
+from threading import Thread
+
+@app.route("/migrate", methods=["POST"])
 def migrate_http():
     try:
-        payload = request.get_json(silent=True) or {}
-        if not payload:
-            payload = {**request.args}
+        collection = request.json.get("collection", "users")
+        since_str = request.json.get("since")
+        since = datetime.fromisoformat(since_str) if since_str else None
+        full_sync = request.json.get("full_sync", False)
+        page_size = request.json.get("page_size", 500)
+        dry_run = request.json.get("dry_run", False)
 
-        # ✅ รองรับ multi-collection
-        collections = payload.get("collection")
-        if not collections:
-            # ถ้าไม่ได้ส่งมา → default เป็น users และ temps
-            collections = COLLECTIONS_TO_MIGRATE
-        elif isinstance(collections, str):
-            # ถ้าส่งมาเป็น string → แปลงเป็น list
-            collections = [c.strip() for c in collections.split(",") if c.strip()]
-        
-        # Validate collections
-        invalid = [c for c in collections if c not in COLLECTIONS_TO_MIGRATE]
-        if invalid:
-            return jsonify({
-                "ok": False,
-                "error": f"Invalid collection(s): {invalid}. Use only {COLLECTIONS_TO_MIGRATE}"
-            }), 400
+        def run_migration():
+            try:
+                processed, migrated = migrate_all_to_users_history(
+                    collection=collection,
+                    since=since,
+                    full_sync=full_sync,
+                    page_size=page_size,
+                    dry_run=dry_run
+                )
+                logger.info(f"Migration completed: {processed} processed, {migrated} migrated")
+            except Exception as e:
+                logger.error(f"Migration failed in background: {str(e)}", exc_info=True)
 
-        log_level = (payload.get("log_level") or "INFO").upper()
-        if log_level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-            logger.setLevel(log_level)
+        # Run migration in background thread
+        thread = Thread(target=run_migration)
+        thread.start()
 
-        full_sync = _to_bool(payload.get("full_sync"), default=False)
-        dry_run = _to_bool(payload.get("dry_run"), default=True)
-        page_size_raw = payload.get("page_size")
-        try:
-            page_size = int(page_size_raw) if page_size_raw is not None else DEFAULT_PAGE_SIZE
-        except Exception:
-            page_size = DEFAULT_PAGE_SIZE
-
-        # ✅ ใช้ last_execution_time_history ตัวเดียวกัน
-        since_date = None
-        since_param = payload.get("since")
-        if since_param:
-            since_date = _parse_since_param(str(since_param))
-        elif not full_sync:
-            last_exec = get_last_execution_from_db()
-            if last_exec:
-                since_date = last_exec
-
-        start = time.time()
-        results = []
-
-        # ✅ วน migrate ทีละ collection
-        total_processed = 0
-        total_migrated = 0
-        for col in collections:
-            logger.info(f"=== Starting migration for collection: {col} ===")
-            processed, migrated = migrate_all_to_users_history(
-                collection=col,
-                since=since_date,
-                full_sync=full_sync,
-                page_size=page_size,
-                dry_run=dry_run
-            )
-            total_processed += processed
-            total_migrated += migrated
-            results.append({
-                "collection": col,
-                "processed": processed,
-                "migrated": migrated
-            })
-
-        # ✅ Update last_execution_time_history หลังจาก migrate ครบทุก collection
-        if not dry_run:
-            set_last_execution_in_db(datetime.now(pytz.UTC))
-
-        duration = round(time.time() - start, 3)
         return jsonify({
-            "ok": True,
-            "collections": results,
-            "processed_total": total_processed,
-            "migrated_total": total_migrated,
-            "dry_run": dry_run,
-            "full_sync": full_sync,
-            "since_used": since_date.isoformat() if since_date else None,
-            "duration_sec": duration
+            "status": "started",
+            "message": f"Migration started for collection {collection}. Check logs for progress."
         })
 
     except Exception as e:
-        logger.error("/migrate failed", exc_info=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logger.error(f"Migration error: {str(e)}", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 
