@@ -53,6 +53,16 @@ def parse_ts(val: Union[datetime, int, float, str, None]) -> Optional[datetime]:
 def initialize_firebase() -> firestore.client:
     """Initializes Firebase from environment variables."""
     try:
+        # Check if Firebase is already initialized
+        try:
+            # Try to get the default app - if it exists, we're already initialized
+            firebase_admin.get_app()
+            logger.info("Firebase already initialized, using existing app.")
+            return firebase_admin.firestore.client()
+        except ValueError:
+            # Firebase not initialized yet, proceed with initialization
+            pass
+        
         firebase_creds_json = os.environ.get('FIREBASE_CREDS')
         if not firebase_creds_json:
             raise ValueError("FIREBASE_CREDS environment variable not set")
@@ -192,140 +202,102 @@ def migrate_all_to_users_history(
 ) -> Tuple[int, int]:
     """
     Migrates records from Firestore to Supabase users_history table based on collection selection.
-    
-    This function automatically handles both timestamp and lastUpdate fields by:
-    1. Using compound queries when filtering by date to check both fields
-    2. Storing both timestamp values in the database
-    3. Using the maximum (most recent) timestamp for sorting and processing
-    
+
+    Changes:
+        - When using `since`, only filter by `timestamp`
+        - `lastUpdate` is stored but no longer used for filtering or sorting
+
     Args:
         collection: The Firestore collection to migrate ('users' or 'temps')
-        since: Only migrate records newer than this datetime (checks both timestamp and lastUpdate)
+        since: Only migrate records with timestamp newer than this datetime
         full_sync: Migrate all records regardless of timestamp
         page_size: Number of user documents to process at once
         dry_run: If True, only count records without inserting
-        
+
     Returns:
         Tuple of (total_records_processed, records_migrated)
     """
     if collection not in COLLECTIONS_TO_MIGRATE:
         logger.error(f"Invalid collection: {collection}")
         return 0, 0
-    
+
     fs_db = initialize_firebase()
     total_processed = 0
     total_migrated = 0
-    
+
     try:
         conn = get_db_connection("migration to users_history")
         cur = conn.cursor()
-        
+
         logger.info(f"Starting migration for collection: {collection}")
-        
-        # Get all user documents in the collection
+
         users_ref = fs_db.collection(collection)
         user_docs = list(users_ref.stream())
-        
+
         for user_doc in user_docs:
             user_id = user_doc.id
             records_ref = fs_db.collection(collection).document(user_id).collection("records")
-            
-            if full_sync:
-                records_query = records_ref
-            elif since:
-                # Use a compound query to get records newer than the since date
-                # by checking both timestamp and lastUpdate fields
-                # This ensures we don't miss records that might have different timestamp formats
-                # Note: Firestore compound queries with AND require both fields to exist
-                # For now, let's use a simpler approach - get all records and filter in Python
-                records_query = records_ref
-            else:
-                records_query = records_ref
-            
+
+            # Always fetch all records, filtering happens in Python
+            records_query = records_ref
             user_records = list(records_query.stream())
-            
-            # Filter by since date if specified (in Python since Firestore compound queries are complex)
+
+            # Filter by timestamp if since is provided and full_sync is False
             if since and not full_sync:
                 filtered_records = []
                 for rec in user_records:
                     data = rec.to_dict()
                     timestamp_ts = parse_ts(data.get("timestamp"))
-                    last_update_ts = parse_ts(data.get("lastUpdate"))
-                    
-                    # Check if either timestamp is newer than the since date
+
+                    # Only check timestamp, ignore lastUpdate completely
                     if timestamp_ts and timestamp_ts > since:
                         filtered_records.append(rec)
-                    elif last_update_ts and last_update_ts > since:
-                        filtered_records.append(rec)
                 user_records = filtered_records
-            
+
             total_processed += len(user_records)
-            
             if not user_records:
                 continue
-            
-            # Group records by recorder
+
+            # Group records by recorder (no need to sort by lastUpdate anymore)
             grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
             for rec in user_records:
                 data = rec.to_dict()
                 recorder = data.get("recorder") or "unknown"
-                
-                # Get both timestamp fields and use the maximum (most recent)
+
+                # Use timestamp only; fallback to datetime.min if missing
                 timestamp_ts = parse_ts(data.get("timestamp"))
-                last_update_ts = parse_ts(data.get("lastUpdate"))
-                
-                # Use the maximum of both timestamps, fallback to minimum if neither exists
-                # This ensures we always use the most recent timestamp available
-                if timestamp_ts and last_update_ts:
-                    effective_timestamp = max(timestamp_ts, last_update_ts)
-                elif timestamp_ts:
-                    effective_timestamp = timestamp_ts
-                elif last_update_ts:
-                    effective_timestamp = last_update_ts
-                else:
-                    effective_timestamp = datetime.min.replace(tzinfo=pytz.UTC)
-                
+                effective_timestamp = timestamp_ts or datetime.min.replace(tzinfo=pytz.UTC)
+
                 grouped_records.setdefault(recorder, []).append((effective_timestamp, rec.id, data))
-            
+
             # Process each recorder's records
             for recorder, rec_list in grouped_records.items():
-                for last_update_ts, rec_id, data in rec_list:
+                for effective_timestamp, rec_id, data in rec_list:
                     try:
-                        # Prepare data for insertion
                         version = data.get("version")
                         prediction = data.get("prediction", {})
                         risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
                         prediction_risk_for_db = str(risk_val) if risk_val is not None else None
-                        
-                        # Get both timestamp values for storage
-                        timestamp_ts = parse_ts(data.get("timestamp"))
+
+                        # Store lastUpdate in DB, but ignore it for filtering
                         last_update_ts = parse_ts(data.get("lastUpdate"))
-                        
+
                         counts = {
-                            field: 1 if data.get(field) is not None else 0 
+                            field: 1 if data.get(field) is not None else 0
                             for field in FIELDS_TO_COUNT
                         }
-                        
+
                         if not dry_run:
-                            # Build and execute the insert query
                             fields = ', '.join(FIELDS_TO_COUNT)
-                            placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))  # Fixed: 6 base fields + FIELDS_TO_COUNT
-                            
-                            # Debug logging
-                            base_values = [user_id, recorder, rec_id, version, last_update_ts, prediction_risk_for_db]
+                            placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
+
+                            base_values = [user_id, recorder, rec_id, version, effective_timestamp, prediction_risk_for_db]
                             field_values = [counts[f] for f in FIELDS_TO_COUNT]
                             all_values = base_values + field_values
-                            
-                            logger.debug(f"SQL Fields: {len(FIELDS_TO_COUNT)} + 6 = {6 + len(FIELDS_TO_COUNT)}")
-                            logger.debug(f"Base values: {len(base_values)}")
-                            logger.debug(f"Field values: {len(field_values)}")
-                            logger.debug(f"Total values: {len(all_values)}")
-                            logger.debug(f"Expected: {6 + len(FIELDS_TO_COUNT)}")
-                            
-                            # Verify the count matches
+
                             if len(all_values) != (6 + len(FIELDS_TO_COUNT)):
                                 raise ValueError(f"Value count mismatch: {len(all_values)} vs {6 + len(FIELDS_TO_COUNT)}")
-                            
+
                             cur.execute(f"""
                                 INSERT INTO users_history (
                                     user_id, recorder, record_id, version, last_update,
@@ -333,30 +305,30 @@ def migrate_all_to_users_history(
                                 ) VALUES ({placeholders})
                                 ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
                             """, all_values)
-                            
+
                             total_migrated += 1
-                            if total_migrated % 100 == 0:
+                            if total_migrated % 10 == 0:
                                 conn.commit()
                                 logger.info(f"Migrated {total_migrated} records...")
-                        
+
                     except Exception as e:
                         logger.error(
                             f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
                             exc_info=True
                         )
                         conn.rollback()
-        
+
         logger.info(f"Finished processing {collection} collection")
-        
+
         if not dry_run:
             conn.commit()
-        
+
         logger.info(
             f"Migration complete. Processed {total_processed} records, "
             f"migrated {total_migrated} new records."
         )
         return total_processed, total_migrated
-        
+
     except Exception as e:
         logger.error(f"Migration failed: {str(e)}", exc_info=True)
         if 'conn' in locals():
@@ -368,6 +340,7 @@ def migrate_all_to_users_history(
         if 'conn' in locals():
             conn.close()
 
+            
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -616,15 +589,24 @@ def index() -> Response:
 def migrate_http():
     try:
         payload = request.get_json(silent=True) or {}
-        # Merge in query params as fallback
         if not payload:
             payload = {**request.args}
 
-        collection = (payload.get("collection") or "").strip()
-        if collection not in COLLECTIONS_TO_MIGRATE:
+        # ✅ รองรับ multi-collection
+        collections = payload.get("collection")
+        if not collections:
+            # ถ้าไม่ได้ส่งมา → default เป็น users และ temps
+            collections = COLLECTIONS_TO_MIGRATE
+        elif isinstance(collections, str):
+            # ถ้าส่งมาเป็น string → แปลงเป็น list
+            collections = [c.strip() for c in collections.split(",") if c.strip()]
+        
+        # Validate collections
+        invalid = [c for c in collections if c not in COLLECTIONS_TO_MIGRATE]
+        if invalid:
             return jsonify({
                 "ok": False,
-                "error": f"Invalid collection. Use one of {COLLECTIONS_TO_MIGRATE}"
+                "error": f"Invalid collection(s): {invalid}. Use only {COLLECTIONS_TO_MIGRATE}"
             }), 400
 
         log_level = (payload.get("log_level") or "INFO").upper()
@@ -639,6 +621,7 @@ def migrate_http():
         except Exception:
             page_size = DEFAULT_PAGE_SIZE
 
+        # ✅ ใช้ last_execution_time_history ตัวเดียวกัน
         since_date = None
         since_param = payload.get("since")
         if since_param:
@@ -649,31 +632,48 @@ def migrate_http():
                 since_date = last_exec
 
         start = time.time()
-        processed, migrated = migrate_all_to_users_history(
-            collection=collection,
-            since=since_date,
-            full_sync=full_sync,
-            page_size=page_size,
-            dry_run=dry_run
-        )
+        results = []
 
+        # ✅ วน migrate ทีละ collection
+        total_processed = 0
+        total_migrated = 0
+        for col in collections:
+            logger.info(f"=== Starting migration for collection: {col} ===")
+            processed, migrated = migrate_all_to_users_history(
+                collection=col,
+                since=since_date,
+                full_sync=full_sync,
+                page_size=page_size,
+                dry_run=dry_run
+            )
+            total_processed += processed
+            total_migrated += migrated
+            results.append({
+                "collection": col,
+                "processed": processed,
+                "migrated": migrated
+            })
+
+        # ✅ Update last_execution_time_history หลังจาก migrate ครบทุก collection
         if not dry_run:
             set_last_execution_in_db(datetime.now(pytz.UTC))
 
         duration = round(time.time() - start, 3)
         return jsonify({
             "ok": True,
-            "collection": collection,
-            "processed": processed,
-            "migrated": migrated,
+            "collections": results,
+            "processed_total": total_processed,
+            "migrated_total": total_migrated,
             "dry_run": dry_run,
             "full_sync": full_sync,
             "since_used": since_date.isoformat() if since_date else None,
             "duration_sec": duration
         })
+
     except Exception as e:
         logger.error("/migrate failed", exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 # Keep CLI usage working
