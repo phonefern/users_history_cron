@@ -10,8 +10,7 @@ import argparse
 import logging
 from typing import Optional, Dict, List, Tuple, Union
 import json
-from flask import Flask, request, jsonify, Response
-
+from flask import Flask, request, jsonify
 
 # Configure logging
 logging.basicConfig(
@@ -23,6 +22,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Initialize Flask app
+app = Flask(__name__)
 
 # Constants
 BANGKOK_TZ = pytz.timezone('Asia/Bangkok')
@@ -54,15 +56,9 @@ def initialize_firebase() -> firestore.client:
     """Initializes Firebase from environment variables."""
     try:
         # Check if Firebase is already initialized
-        try:
-            # Try to get the default app - if it exists, we're already initialized
-            firebase_admin.get_app()
-            logger.info("Firebase already initialized, using existing app.")
+        if firebase_admin._apps:
             return firebase_admin.firestore.client()
-        except ValueError:
-            # Firebase not initialized yet, proceed with initialization
-            pass
-        
+            
         firebase_creds_json = os.environ.get('FIREBASE_CREDS')
         if not firebase_creds_json:
             raise ValueError("FIREBASE_CREDS environment variable not set")
@@ -201,15 +197,19 @@ def migrate_all_to_users_history(
     dry_run: bool = False
 ) -> Tuple[int, int]:
     """
-    Migrates records from Firestore to Supabase users_history table using batch processing.
-    
+    Migrates records from Firestore to Supabase users_history table based on collection selection.
+
+    Changes:
+        - When using `since`, only filter by `timestamp`
+        - `lastUpdate` is stored but no longer used for filtering or sorting
+
     Args:
         collection: The Firestore collection to migrate ('users' or 'temps')
-        since: Only migrate records newer than this datetime (checks only 'timestamp' now)
+        since: Only migrate records with timestamp newer than this datetime
         full_sync: Migrate all records regardless of timestamp
-        page_size: Number of user documents to process per batch
+        page_size: Number of user documents to process at once
         dry_run: If True, only count records without inserting
-        
+
     Returns:
         Tuple of (total_records_processed, records_migrated)
     """
@@ -220,7 +220,6 @@ def migrate_all_to_users_history(
     fs_db = initialize_firebase()
     total_processed = 0
     total_migrated = 0
-    batch_count = 0
 
     try:
         conn = get_db_connection("migration to users_history")
@@ -228,99 +227,92 @@ def migrate_all_to_users_history(
 
         logger.info(f"Starting migration for collection: {collection}")
 
-        # Setup Firestore reference
         users_ref = fs_db.collection(collection)
-        last_doc = None
+        user_docs = list(users_ref.stream())
 
-        while True:
-            # Fetch next batch of users
-            query = users_ref.limit(page_size)
-            if last_doc:
-                query = query.start_after(last_doc)
+        for user_doc in user_docs:
+            user_id = user_doc.id
+            records_ref = fs_db.collection(collection).document(user_id).collection("records")
 
-            user_docs = list(query.stream())
-            if not user_docs:
-                break
+            # Always fetch all records, filtering happens in Python
+            records_query = records_ref
+            user_records = list(records_query.stream())
 
-            logger.info(f"Processing batch {batch_count + 1} ({len(user_docs)} users)...")
-
-            for user_doc in user_docs:
-                user_id = user_doc.id
-                records_ref = fs_db.collection(collection).document(user_id).collection("records")
-                user_records = list(records_ref.stream())
-
-                # Filter records by since if provided (now we only check timestamp)
-                if since and not full_sync:
-                    user_records = [
-                        rec for rec in user_records
-                        if (ts := parse_ts(rec.to_dict().get("timestamp"))) and ts > since
-                    ]
-
-                total_processed += len(user_records)
-                if not user_records:
-                    continue
-
-                # Group records by recorder
-                grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
+            # Filter by timestamp if since is provided and full_sync is False
+            if since and not full_sync:
+                filtered_records = []
                 for rec in user_records:
                     data = rec.to_dict()
-                    recorder = data.get("recorder") or "unknown"
-                    timestamp_ts = parse_ts(data.get("timestamp")) or datetime.min.replace(tzinfo=pytz.UTC)
-                    grouped_records.setdefault(recorder, []).append((timestamp_ts, rec.id, data))
+                    timestamp_ts = parse_ts(data.get("timestamp"))
 
-                # Insert into database
-                for recorder, rec_list in grouped_records.items():
-                    for timestamp_ts, rec_id, data in rec_list:
-                        try:
-                            version = data.get("version")
-                            prediction = data.get("prediction", {})
-                            risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
-                            prediction_risk_for_db = str(risk_val) if risk_val is not None else None
+                    # Only check timestamp, ignore lastUpdate completely
+                    if timestamp_ts and timestamp_ts > since:
+                        filtered_records.append(rec)
+                user_records = filtered_records
 
-                            counts = {
-                                field: 1 if data.get(field) is not None else 0
-                                for field in FIELDS_TO_COUNT
-                            }
+            total_processed += len(user_records)
+            if not user_records:
+                continue
 
-                            if not dry_run:
-                                fields = ', '.join(FIELDS_TO_COUNT)
-                                placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
-                                all_values = [
-                                    user_id,
-                                    recorder,
-                                    rec_id,
-                                    version,
-                                    timestamp_ts,
-                                    prediction_risk_for_db
-                                ] + [counts[f] for f in FIELDS_TO_COUNT]
+            # Group records by recorder (no need to sort by lastUpdate anymore)
+            grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
+            for rec in user_records:
+                data = rec.to_dict()
+                recorder = data.get("recorder") or "unknown"
 
-                                cur.execute(f"""
-                                    INSERT INTO users_history (
-                                        user_id, recorder, record_id, version, last_update,
-                                        prediction_risk, {fields}
-                                    ) VALUES ({placeholders})
-                                    ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
-                                """, all_values)
+                # Use timestamp only; fallback to datetime.min if missing
+                timestamp_ts = parse_ts(data.get("timestamp"))
+                effective_timestamp = timestamp_ts or datetime.min.replace(tzinfo=pytz.UTC)
 
-                                total_migrated += 1
+                grouped_records.setdefault(recorder, []).append((effective_timestamp, rec.id, data))
 
-                                # Commit every 500 records
-                                if total_migrated % 500 == 0:
-                                    conn.commit()
-                                    logger.info(f"Committed {total_migrated} records so far...")
+            # Process each recorder's records
+            for recorder, rec_list in grouped_records.items():
+                for effective_timestamp, rec_id, data in rec_list:
+                    try:
+                        version = data.get("version")
+                        prediction = data.get("prediction", {})
+                        risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
+                        prediction_risk_for_db = str(risk_val) if risk_val is not None else None
 
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
-                                exc_info=True
-                            )
-                            conn.rollback()
+                        # Store lastUpdate in DB, but ignore it for filtering
+                        last_update_ts = parse_ts(data.get("lastUpdate"))
 
-            # Update last_doc for pagination
-            last_doc = user_docs[-1]
-            batch_count += 1
-            conn.commit()
-            logger.info(f"Batch {batch_count} completed. Total migrated: {total_migrated}")
+                        counts = {
+                            field: 1 if data.get(field) is not None else 0
+                            for field in FIELDS_TO_COUNT
+                        }
+
+                        if not dry_run:
+                            fields = ', '.join(FIELDS_TO_COUNT)
+                            placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
+
+                            base_values = [user_id, recorder, rec_id, version, effective_timestamp, prediction_risk_for_db]
+                            field_values = [counts[f] for f in FIELDS_TO_COUNT]
+                            all_values = base_values + field_values
+
+                            if len(all_values) != (6 + len(FIELDS_TO_COUNT)):
+                                raise ValueError(f"Value count mismatch: {len(all_values)} vs {6 + len(FIELDS_TO_COUNT)}")
+
+                            cur.execute(f"""
+                                INSERT INTO users_history (
+                                    user_id, recorder, record_id, version, last_update,
+                                    prediction_risk, {fields}
+                                ) VALUES ({placeholders})
+                                ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
+                            """, all_values)
+
+                            total_migrated += 1
+                            if total_migrated % 10 == 0:
+                                conn.commit()
+                                logger.info(f"Migrated {total_migrated} records...")
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
+                            exc_info=True
+                        )
+                        conn.rollback()
 
         logger.info(f"Finished processing {collection} collection")
 
@@ -345,8 +337,6 @@ def migrate_all_to_users_history(
             conn.close()
 
 
-
-            
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -385,9 +375,91 @@ def parse_args():
         default='INFO',
         help='Set the logging level'
     )
+    parser.add_argument(
+        '--http',
+        action='store_true',
+        help='Run as HTTP server instead of CLI'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=5000,
+        help='Port for HTTP server (default: 5000)'
+    )
 
     return parser.parse_args()
-    
+
+
+@app.route('/run', methods=['GET', 'POST'])
+def run_migration():
+    """HTTP endpoint to trigger migration."""
+    try:
+        # Get parameters from query string or JSON body
+        if request.method == 'GET':
+            migration_type = request.args.get('type', 'incremental')
+            collection = request.args.get('collection', 'users')
+            dry_run = request.args.get('dry_run', 'false').lower() == 'true'
+        else:
+            data = request.get_json() or {}
+            migration_type = data.get('type', 'incremental')
+            collection = data.get('collection', 'users')
+            dry_run = data.get('dry_run', False)
+        
+        # Validate collection
+        if collection not in COLLECTIONS_TO_MIGRATE:
+            return jsonify({
+                'status': 'error',
+                'message': f'Invalid collection: {collection}. Must be one of {COLLECTIONS_TO_MIGRATE}'
+            }), 400
+        
+        # Determine since date based on migration type
+        since_date = None
+        if migration_type == 'incremental':
+            logger.info("Running incremental migration")
+            since_date = get_last_execution_from_db()
+            if since_date:
+                logger.info(f"Using last execution time from DB: {since_date.isoformat()}")
+            else:
+                logger.info("No prior execution time found; will process all records")
+        
+        # Run migration
+        start_time = time.time()
+        processed, migrated = migrate_all_to_users_history(
+            collection=collection,
+            since=since_date,
+            full_sync=(migration_type == 'full'),
+            dry_run=dry_run
+        )
+        
+        # Update last execution time if not dry run
+        if not dry_run and migrated > 0:
+            set_last_execution_in_db(datetime.now(pytz.UTC))
+        
+        execution_time = time.time() - start_time
+        
+        return jsonify({
+            'status': 'success',
+            'collection': collection,
+            'type': migration_type,
+            'dry_run': dry_run,
+            'processed': processed,
+            'migrated': migrated,
+            'execution_time_seconds': round(execution_time, 2)
+        })
+        
+    except Exception as e:
+        logger.error(f"HTTP migration failed: {str(e)}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({'status': 'healthy'})
+
 
 def main():
     """Main entry point for the migration script."""
@@ -400,7 +472,12 @@ def main():
     # Set logging level
     logger.setLevel(args.log_level)
     
-
+    # Run as HTTP server if requested
+    if args.http:
+        logger.info(f"Starting HTTP server on port {args.port}")
+        app.run(host='0.0.0.0', port=args.port)
+        return
+    
     # Parse since date if provided
     since_date = None
     if args.since:
@@ -429,9 +506,6 @@ def main():
             logger.info(f"Using last execution time from DB: {since_date.isoformat()}")
         else:
             logger.info("No prior execution time found; running full scan (or use --since to restrict).")
-            # If you prefer to treat as full sync when no status, you can set full_sync=True here.
-            # For safety, we will leave full_sync as-is (default False) which will process all users but
-            # filtering will be applied only if 'since' is set (we are not forcing full sync).
 
     
     logger.info("Starting migration process")
@@ -450,8 +524,8 @@ def main():
             dry_run=args.dry_run
         )
 
-        # ถ้าไม่เป็น dry-run และ migration สำเร็จ ให้บันทึก last execution เป็นเวลาปัจจุบัน (UTC)
-        if not args.dry_run:
+        # Update last execution time if not dry run
+        if not args.dry_run and migrated > 0:
             ok = set_last_execution_in_db(datetime.now(pytz.UTC))
             if not ok:
                 logger.warning("Migration finished but failed to update migration_status.last_execution_time_history")
@@ -466,173 +540,6 @@ def main():
         logger.critical(f"Migration failed after {time.time() - start_time:.2f} seconds: {str(e)}")
         raise
 
-############################
-# Flask application section #
-############################
 
-# Create Flask app for Render web service
-app = Flask(__name__)
-
-
-def _parse_since_param(since_str: Optional[str]) -> Optional[datetime]:
-    if not since_str:
-        return None
-    try:
-        val = float(since_str)
-        if val > 1e12:
-            return datetime.fromtimestamp(val / 1000.0, tz=BANGKOK_TZ)
-        return datetime.fromtimestamp(val, tz=BANGKOK_TZ)
-    except ValueError:
-        try:
-            return datetime.strptime(since_str, '%Y-%m-%d').replace(tzinfo=BANGKOK_TZ)
-        except ValueError:
-            raise ValueError("Invalid since format. Use YYYY-MM-DD or unix(ts/ms)")
-
-
-def _to_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
-        return default
-    return str(val).lower() in {"1", "true", "t", "yes", "y", "on"}
-
-
-@app.before_request
-def _load_env_if_needed():
-    # Ensure .env is loaded in web context
-    load_dotenv()
-
-
-@app.get("/health")
-def health() -> Response:
-    return Response("ok", mimetype="text/plain")
-
-
-@app.get("/")
-def index() -> Response:
-    html = (
-        """
-        <!doctype html>
-        <html>
-        <head>
-          <meta charset='utf-8'/>
-          <meta name='viewport' content='width=device-width, initial-scale=1'/>
-          <title>Migration Trigger</title>
-          <style>
-            body { font-family: system-ui, sans-serif; margin: 2rem; }
-            label { display:block; margin: .5rem 0 .25rem; }
-            input, select { padding:.5rem; width: 320px; max-width: 100%; }
-            button { padding:.6rem 1rem; margin-top:1rem; }
-            pre { background:#f6f8fa; padding:1rem; overflow:auto; }
-            .row { margin-bottom: .5rem; }
-          </style>
-        </head>
-        <body>
-          <h1>Trigger Migration</h1>
-          <form id="f">
-            <div class="row">
-              <label>Collection</label>
-              <select name="collection" required>
-                <option value="users">users</option>
-                <option value="temps">temps</option>
-              </select>
-            </div>
-            <div class="row">
-              <label>Since (YYYY-MM-DD or unix ts/ms)</label>
-              <input name="since" placeholder="Optional" />
-            </div>
-            <div class="row">
-              <label>Full sync</label>
-              <select name="full_sync">
-                <option value="false">false</option>
-                <option value="true">true</option>
-              </select>
-            </div>
-            <div class="row">
-              <label>Dry run</label>
-              <select name="dry_run">
-                <option value="true">true</option>
-                <option value="false">false</option>
-              </select>
-            </div>
-            <div class="row">
-              <label>Page size</label>
-              <input type="number" name="page_size" value="%PAGE_SIZE%" min="1" />
-            </div>
-            <div class="row">
-              <label>Log level</label>
-              <select name="log_level">
-                <option>INFO</option>
-                <option>DEBUG</option>
-                <option>WARNING</option>
-                <option>ERROR</option>
-                <option>CRITICAL</option>
-              </select>
-            </div>
-            <button type="submit">Run migration</button>
-          </form>
-          <h2>Result</h2>
-          <pre id="out">(no run yet)</pre>
-          <script>
-            const f = document.getElementById('f');
-            const out = document.getElementById('out');
-            f.addEventListener('submit', async (e) => {
-              e.preventDefault();
-              const data = new FormData(f);
-              const body = Object.fromEntries(data.entries());
-              const res = await fetch('/migrate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-              const txt = await res.text();
-              try { out.textContent = JSON.stringify(JSON.parse(txt), null, 2); } catch { out.textContent = txt; }
-            });
-          </script>
-        </body>
-        </html>
-        """
-        .replace("%PAGE_SIZE%", str(DEFAULT_PAGE_SIZE))
-    )
-    return Response(html, mimetype="text/html")
-
-
-from threading import Thread
-
-@app.route("/migrate", methods=["POST"])
-def migrate_http():
-    try:
-        collection = request.json.get("collection", "users")
-        since_str = request.json.get("since")
-        since = datetime.fromisoformat(since_str) if since_str else None
-        full_sync = request.json.get("full_sync", False)
-        page_size = request.json.get("page_size", 500)
-        dry_run = request.json.get("dry_run", False)
-
-        def run_migration():
-            try:
-                processed, migrated = migrate_all_to_users_history(
-                    collection=collection,
-                    since=since,
-                    full_sync=full_sync,
-                    page_size=page_size,
-                    dry_run=dry_run
-                )
-                logger.info(f"Migration completed: {processed} processed, {migrated} migrated")
-            except Exception as e:
-                logger.error(f"Migration failed in background: {str(e)}", exc_info=True)
-
-        # Run migration in background thread
-        thread = Thread(target=run_migration)
-        thread.start()
-
-        return jsonify({
-            "status": "started",
-            "message": f"Migration started for collection {collection}. Check logs for progress."
-        })
-
-    except Exception as e:
-        logger.error(f"Migration error: {str(e)}", exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-
-# Keep CLI usage working
 if __name__ == "__main__":
-    # If launched directly, run the CLI entrypoint
     main()
-
