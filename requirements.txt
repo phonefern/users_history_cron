@@ -1,5 +1,18 @@
+# Core dependencies
+Flask
 firebase-admin
 psycopg2-binary
-python-dotenv
 pytz
-flask
+gunicorn
+schedule
+python-dotenv
+
+# Development/testing dependencies (optional)
+pytest==7.4.0
+pytest-cov==4.1.0
+flake8==6.1.0
+black==23.9.1
+
+# Additional utilities
+python-dateutil==2.8.2
+requests==2.31.0
