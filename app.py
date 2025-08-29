@@ -3,40 +3,125 @@ from firebase_admin import credentials, firestore
 import psycopg2
 import os
 from dotenv import load_dotenv
+# Load environment variables from .env file
+load_dotenv()
+
+from psycopg2.extras import execute_values
 import time
 from datetime import datetime, timedelta
 import pytz
-import argparse
-import logging
-from typing import Optional, Dict, List, Tuple, Union
+import threading
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from functools import wraps
 import json
-from flask import Flask, request, jsonify
+import logging
+import schedule
+import itertools
+
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('migration.log')
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
 app = Flask(__name__)
-
-# Constants
 BANGKOK_TZ = pytz.timezone('Asia/Bangkok')
+
+# --- Firebase Initialization ---
+def initialize_firebase():
+    """Initializes Firebase from environment variables."""
+    try:
+        firebase_creds_json = os.environ.get('FIREBASE_CREDS')
+        if not firebase_creds_json:
+            raise ValueError("FIREBASE_CREDS environment variable not set. Please set it as a JSON string.")
+
+        firebase_creds_dict = json.loads(firebase_creds_json)
+        
+        if 'private_key' in firebase_creds_dict and isinstance(firebase_creds_dict['private_key'], str):
+            firebase_creds_dict['private_key'] = firebase_creds_dict['private_key'].replace('\\n', '\n')
+            
+        cred = credentials.Certificate(firebase_creds_dict)
+        firebase_admin.initialize_app(cred)
+        logger.info("Firebase initialized successfully.")
+        return firebase_admin.firestore.client()
+    except Exception as e:
+        logger.critical(f"Firebase initialization failed: {str(e)}. Exiting.")
+        raise
+
+# Initialize Firebase (this will raise an error if env var is missing/malformed)
+fs_db = initialize_firebase()
+
+# --- Supabase (PostgreSQL) Connection ---
+def get_db_connection(connection_purpose=None):
+    """
+    Establishes a connection to the Supabase PostgreSQL database with enhanced logging.
+    """
+    conn = None
+    connection_info = {
+        'host': os.getenv("SUPABASE_HOST", "aws-0-ap-southeast-1.pooler.supabase.com"),
+        'port': os.getenv("SUPABASE_PORT", "6543"),
+        'dbname': os.getenv("SUPABASE_DB", "postgres"),
+        'user': os.getenv("SUPABASE_USER", "postgres.mieiwzfhohifeprjtnek"),
+        'connect_timeout': 10
+    }
+    
+    try:
+        logged_info = connection_info.copy()
+        logged_info['password'] = '*******' if os.getenv("SUPABASE_PASSWORD") else 'default_pwd'
+        
+        logger.debug(f"Attempting DB connection with params: {logged_info}")
+        if connection_purpose:
+            logger.debug(f"Connection purpose: {connection_purpose}")
+        
+        start_time = time.time()
+        conn = psycopg2.connect(
+            password=os.getenv("SUPABASE_PASSWORD", "root"),
+            **connection_info
+        )
+        
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid() AS pid, current_database()")
+            db_info = cur.fetchone()
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE pid != pg_backend_pid()")
+            other_connections = cur.fetchone()[0]
+        
+        connection_time = round((time.time() - start_time) * 1000, 2)
+        logger.info(
+            f"DB connection established | "
+            f"PID: {db_info[0]} | DB: {db_info[1]} | "
+            f"Other active connections: {other_connections} | "
+            f"Connection time: {connection_time}ms"
+        )
+        
+        return conn
+        
+    except Exception as e:
+        logger.error(
+            f"DB connection failed after {round((time.time() - start_time) * 1000, 2)}ms | "
+            f"Error: {str(e)}"
+        )
+        raise
+
+last_execution = None 
+is_running = False 
+execution_history = [] 
+
 FIELDS_TO_COUNT = [
     "balance", "dualTap", "dualTapRight", "gaitWalk",
     "pinchToSize", "pinchToSizeRight", "questionnaire",
     "tremorPostural", "tremorResting", "voiceAhh", "voiceYPL"
 ]
-COLLECTIONS_TO_MIGRATE = ['users', 'temps']
-DEFAULT_PAGE_SIZE = 100
 
-def parse_ts(val: Union[datetime, int, float, str, None]) -> Optional[datetime]:
+def now_thai():
+    """Returns the current datetime in the Bangkok timezone."""
+    return datetime.now(BANGKOK_TZ)
+
+def format_dt(dt):
+    """Formats a datetime object to a string in Bangkok timezone, or 'ยังไม่เคย' if None."""
+    if not dt:
+        return "ยังไม่เคย"
+    return dt.astimezone(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def parse_ts(val):
     """Parses various timestamp formats into a Bangkok-aware datetime object."""
     try:
         if isinstance(val, datetime):
@@ -52,92 +137,22 @@ def parse_ts(val: Union[datetime, int, float, str, None]) -> Optional[datetime]:
         logger.warning(f"Failed to parse timestamp value '{val}' (type: {type(val)}): {str(e)}")
         return None
 
-def initialize_firebase() -> firestore.client:
-    """Initializes Firebase from environment variables."""
-    try:
-        # Check if Firebase is already initialized
-        if firebase_admin._apps:
-            return firebase_admin.firestore.client()
-            
-        firebase_creds_json = os.environ.get('FIREBASE_CREDS')
-        if not firebase_creds_json:
-            raise ValueError("FIREBASE_CREDS environment variable not set")
-        
-        firebase_creds_dict = json.loads(firebase_creds_json)
-        
-        if 'private_key' in firebase_creds_dict:
-            firebase_creds_dict['private_key'] = firebase_creds_dict['private_key'].replace('\\n', '\n')
-            
-        cred = credentials.Certificate(firebase_creds_dict)
-        firebase_admin.initialize_app(cred)
-        logger.info("Firebase initialized successfully.")
-        return firebase_admin.firestore.client()
-    except Exception as e:
-        logger.critical(f"Firebase initialization failed: {str(e)}")
-        raise
-
-def get_db_connection(connection_purpose: Optional[str] = None) -> psycopg2.extensions.connection:
-    """
-    Establishes a connection to the Supabase PostgreSQL database.
-    
-    Args:
-        connection_purpose: Optional description of connection purpose
-        
-    Returns:
-        psycopg2 connection object
-        
-    Raises:
-        Exception: If connection fails
-    """
-    conn_params = {
-        'host': os.getenv("SUPABASE_HOST", "aws-0-ap-southeast-1.pooler.supabase.com"),
-        'port': os.getenv("SUPABASE_PORT", "6543"),
-        'dbname': os.getenv("SUPABASE_DB", "postgres"),
-        'user': os.getenv("SUPABASE_USER", "postgres.mieiwzfhohifeprjtnek"),
-        'password': os.getenv("SUPABASE_PASSWORD", "root"),
-        'connect_timeout': 10
-    }
-    
-    try:
-        start_time = time.time()
-        conn = psycopg2.connect(**conn_params)
-        
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_backend_pid() AS pid, current_database()")
-            db_info = cur.fetchone()
-        
-        logger.info(
-            f"DB connection established | PID: {db_info[0]} | DB: {db_info[1]} | "
-            f"Time: {round((time.time() - start_time) * 1000, 2)}ms"
-        )
-        return conn
-    except Exception as e:
-        logger.error(f"DB connection failed: {str(e)}")
-        raise
-
-def get_last_execution_from_db() -> Optional[datetime]:
-    """
-    Retrieves the last successful execution time from the Supabase `migration_status` table.
-    Returns a timezone-aware datetime in BANGKOK_TZ, or None if not found.
-    """
+# --- Persistent State Management in Supabase ---
+def get_last_execution_from_db():
+    """Retrieves the last successful execution time from the Supabase `migration_status` table."""
     conn = None
     cur = None
     try:
-        conn = get_db_connection("get_last_execution")
+        conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT last_execution_time_history FROM migration_status WHERE id = %s", ('current_status',))
+        cur.execute("SELECT last_execution_time_history FROM migration_status WHERE id = 'current_status'")
         result = cur.fetchone()
         if result and result[0]:
-            # DB should store UTC; convert to Bangkok timezone for local use
-            last_utc: datetime = result[0]
-            if last_utc.tzinfo is None:
-                # assume DB returned naive UTC → localize
-                last_utc = pytz.utc.localize(last_utc)
-            return last_utc.astimezone(BANGKOK_TZ)
+            return result[0].astimezone(BANGKOK_TZ)
         logger.info("No last execution time found in DB, assuming first run.")
         return None
     except Exception as e:
-        logger.error(f"Error fetching last_execution_time from DB: {str(e)}", exc_info=True)
+        logger.error(f"Error fetching last_execution_time_history from DB: {str(e)}")
         return None
     finally:
         if cur:
@@ -145,401 +160,507 @@ def get_last_execution_from_db() -> Optional[datetime]:
         if conn:
             conn.close()
 
-def set_last_execution_in_db(execution_time_utc: Optional[datetime] = None) -> bool:
-    """
-    Upserts the last successful execution time into migration_status.id='current_status'.
-    Stores the provided datetime as UTC in the DB (or uses now UTC if None).
-    Returns True on success, False otherwise.
-    """
+def save_last_execution_to_db(timestamp):
+    """Saves the given timestamp as the last successful execution time to Supabase."""
     conn = None
     cur = None
     try:
-        if execution_time_utc is None:
-            execution_time_utc = datetime.now(pytz.UTC)
-        else:
-            # ensure stored time is UTC
-            if execution_time_utc.tzinfo is None:
-                execution_time_utc = pytz.utc.localize(execution_time_utc)
-            execution_time_utc = execution_time_utc.astimezone(pytz.UTC)
-
-        conn = get_db_connection("set_last_execution")
+        conn = get_db_connection()
         cur = conn.cursor()
-
-        # If migration_status table already has an entry with id='current_status', update it;
-        # otherwise insert a new row. Adjust columns if your table has different schema.
         cur.execute("""
             INSERT INTO migration_status (id, last_execution_time_history)
-            VALUES (%s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                last_execution_time_history = EXCLUDED.last_execution_time_history;
-        """, ('current_status', execution_time_utc))
-
+            VALUES ('current_status', %s)
+            ON CONFLICT (id) DO UPDATE SET last_execution_time_history = EXCLUDED.last_execution_time_history, updated_at = NOW();
+        """, (timestamp.astimezone(pytz.UTC),))
         conn.commit()
-        logger.info(f"Updated migration_status.last_execution_time_history = {execution_time_utc.isoformat()}")
-        return True
+        logger.info(f"Saved last_execution_time_history to DB: {format_dt(timestamp)}")
     except Exception as e:
-        logger.error(f"Failed to update migration_status in DB: {str(e)}", exc_info=True)
+        logger.error(f"Error saving last_execution_time_history to DB: {str(e)}")
         if conn:
             conn.rollback()
-        return False
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
 
+# --- Decorator for Background Tasks ---
+def background_task(fn):
+    """Decorator to manage task running status and logging."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        global is_running
+        if is_running:
+            logger.warning(f"Attempted to start {fn.__name__} but another task is already running.")
+            return {"status": "error", "message": "Task already running"}
+        
+        is_running = True
+        result = {"status": "error", "message": "Unknown error"}
+        try:
+            logger.info(f"Starting background task: {fn.__name__}")
+            result = fn(*args, **kwargs)
+            logger.info(f"Completed background task: {fn.__name__} (Status: {result.get('status')})")
+        except Exception as e:
+            logger.error(f"Critical error in background task {fn.__name__}: {str(e)}", exc_info=True)
+            result = {"status": "error", "message": f"Critical task error: {str(e)}"}
+        finally:
+            is_running = False
+        return result
+    return wrapper
 
-def migrate_all_to_users_history(
-    collection: str,
-    since: Optional[datetime] = None,
-    full_sync: bool = False,
-    page_size: int = DEFAULT_PAGE_SIZE,
-    dry_run: bool = False
-) -> Tuple[int, int]:
-    """
-    Migrates records from Firestore to Supabase users_history table based on collection selection.
-
-    Changes:
-        - When using `since`, only filter by `timestamp`
-        - `lastUpdate` is stored but no longer used for filtering or sorting
-
-    Args:
-        collection: The Firestore collection to migrate ('users' or 'temps')
-        since: Only migrate records with timestamp newer than this datetime
-        full_sync: Migrate all records regardless of timestamp
-        page_size: Number of user documents to process at once
-        dry_run: If True, only count records without inserting
-
-    Returns:
-        Tuple of (total_records_processed, records_migrated)
-    """
-    if collection not in COLLECTIONS_TO_MIGRATE:
-        logger.error(f"Invalid collection: {collection}")
-        return 0, 0
-
-    fs_db = initialize_firebase()
-    total_processed = 0
-    total_migrated = 0
+# --- Main Migration Logic ---
+@background_task
+def migrate_all(full_sync=False):
+    global last_execution
+    
+    current_start_time = now_thai()
+    since_timestamp = None if full_sync else get_last_execution_from_db()
+    
+    user_count = 0
+    temp_count = 0
+    summary_count = 0
+    migration_status = "success"
+    error_message = ""
 
     try:
-        conn = get_db_connection("migration to users_history")
+        # Migrate summaries from both users and temps collections
+        summary_count = migrate_summaries(since=since_timestamp, full_sync=full_sync)
+        logger.info(f"Migration completed: {summary_count} summaries processed from both users and temps collections.")
+
+    except Exception as e:
+        migration_status = "failed"
+        error_message = str(e)
+        logger.error(f"Migration process failed: {str(e)}", exc_info=True)
+    finally:
+        save_last_execution_to_db(now_thai())
+        last_execution = now_thai()
+
+        execution_history.append({
+            "type": "full" if full_sync else "incremental",
+            "start_time": current_start_time,
+            "end_time": last_execution,
+            "user_count": user_count,
+            "temp_count": temp_count,
+            "summary_count": summary_count,
+            "status": migration_status if migration_status == "success" else f"failed: {error_message}"
+        })
+    
+    return {
+        "status": migration_status,
+        "user_count": user_count,
+        "temp_count": temp_count,
+        "summary_count": summary_count,
+        "message": error_message
+    }
+
+@background_task
+def test_migration(record_count=10):
+    """Test migration with a limited number of records"""
+    global last_execution
+    
+    current_start_time = now_thai()
+    user_count = 0
+    temp_count = 0
+    summary_count = 0
+    migration_status = "success"
+    error_message = ""
+
+    try:
+        summary_count = migrate_summaries(limit=record_count)
+        logger.info(f"Test migration completed: {summary_count} summaries processed.")
+    except Exception as e:
+        migration_status = "failed"
+        error_message = str(e)
+        logger.error(f"Test migration failed: {str(e)}", exc_info=True)
+    finally:
+        save_last_execution_to_db(now_thai())
+        last_execution = now_thai()
+
+        execution_history.append({
+            "type": "test",
+            "start_time": current_start_time,
+            "end_time": last_execution,
+            "user_count": user_count,
+            "temp_count": temp_count,
+            "summary_count": summary_count,
+            "status": migration_status if migration_status == "success" else f"failed: {error_message}",
+            "test_record_count": record_count
+        })
+    
+    return {
+        "status": migration_status,
+        "user_count": user_count,
+        "temp_count": temp_count,
+        "summary_count": summary_count,
+        "message": error_message
+    }
+
+def migrate_summaries(since=None, full_sync=False, limit=None, page_size=100):
+    """
+    Migrates user record summaries from both 'users' and 'temps' collections efficiently.
+    Processes records based on timestamp and last_execution_time_history.
+    """
+    total_count = 0
+    conn = None
+    cur = None
+
+    try:
+        conn = get_db_connection()
         cur = conn.cursor()
 
-        logger.info(f"Starting migration for collection: {collection}")
+        # Process both collections
+        collections = ['users', 'temps']
+        
+        for collection_name in collections:
+            logger.info(f"Processing {collection_name} collection...")
+            collection_count = process_collection(
+                conn, cur, collection_name, since, full_sync, limit, page_size
+            )
+            total_count += collection_count
+            logger.info(f"Completed {collection_name}: {collection_count} summaries")
 
-        users_ref = fs_db.collection(collection)
-        user_docs = list(users_ref.stream())
-
-        for user_doc in user_docs:
-            user_id = user_doc.id
-            records_ref = fs_db.collection(collection).document(user_id).collection("records")
-
-            # Always fetch all records, filtering happens in Python
-            records_query = records_ref
-            user_records = list(records_query.stream())
-
-            # Filter by timestamp if since is provided and full_sync is False
-            if since and not full_sync:
-                filtered_records = []
-                for rec in user_records:
-                    data = rec.to_dict()
-                    timestamp_ts = parse_ts(data.get("timestamp"))
-
-                    # Only check timestamp, ignore lastUpdate completely
-                    if timestamp_ts and timestamp_ts > since:
-                        filtered_records.append(rec)
-                user_records = filtered_records
-
-            total_processed += len(user_records)
-            if not user_records:
-                continue
-
-            # Group records by recorder (no need to sort by lastUpdate anymore)
-            grouped_records: Dict[str, List[Tuple[datetime, str, Dict]]] = {}
-            for rec in user_records:
-                data = rec.to_dict()
-                recorder = data.get("recorder") or "unknown"
-
-                # Use timestamp only; fallback to datetime.min if missing
-                timestamp_ts = parse_ts(data.get("timestamp"))
-                effective_timestamp = timestamp_ts or datetime.min.replace(tzinfo=pytz.UTC)
-
-                grouped_records.setdefault(recorder, []).append((effective_timestamp, rec.id, data))
-
-            # Process each recorder's records
-            for recorder, rec_list in grouped_records.items():
-                for effective_timestamp, rec_id, data in rec_list:
-                    try:
-                        version = data.get("version")
-                        prediction = data.get("prediction", {})
-                        risk_val = prediction.get("risk") if isinstance(prediction, dict) else None
-                        prediction_risk_for_db = str(risk_val) if risk_val is not None else None
-
-                        # Store lastUpdate in DB, but ignore it for filtering
-                        last_update_ts = parse_ts(data.get("lastUpdate"))
-
-                        counts = {
-                            field: 1 if data.get(field) is not None else 0
-                            for field in FIELDS_TO_COUNT
-                        }
-
-                        if not dry_run:
-                            fields = ', '.join(FIELDS_TO_COUNT)
-                            placeholders = ', '.join(['%s'] * (6 + len(FIELDS_TO_COUNT)))
-
-                            base_values = [user_id, recorder, rec_id, version, effective_timestamp, prediction_risk_for_db]
-                            field_values = [counts[f] for f in FIELDS_TO_COUNT]
-                            all_values = base_values + field_values
-
-                            if len(all_values) != (6 + len(FIELDS_TO_COUNT)):
-                                raise ValueError(f"Value count mismatch: {len(all_values)} vs {6 + len(FIELDS_TO_COUNT)}")
-
-                            cur.execute(f"""
-                                INSERT INTO users_history (
-                                    user_id, recorder, record_id, version, last_update,
-                                    prediction_risk, {fields}
-                                ) VALUES ({placeholders})
-                                ON CONFLICT (user_id, recorder, record_id) DO NOTHING;
-                            """, all_values)
-
-                            total_migrated += 1
-                            if total_migrated % 10 == 0:
-                                conn.commit()
-                                logger.info(f"Migrated {total_migrated} records...")
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing record {collection}/{user_id}/{recorder}/{rec_id}: {str(e)}",
-                            exc_info=True
-                        )
-                        conn.rollback()
-
-        logger.info(f"Finished processing {collection} collection")
-
-        if not dry_run:
-            conn.commit()
-
-        logger.info(
-            f"Migration complete. Processed {total_processed} records, "
-            f"migrated {total_migrated} new records."
-        )
-        return total_processed, total_migrated
+        conn.commit()
+        logger.info(f"Total summaries migrated: {total_count}")
+        return total_count
 
     except Exception as e:
         logger.error(f"Migration failed: {str(e)}", exc_info=True)
-        if 'conn' in locals():
+        if conn:
             conn.rollback()
         raise
     finally:
-        if 'cur' in locals():
+        if cur:
             cur.close()
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
+def process_collection(conn, cur, collection_name, since, full_sync, limit, page_size):
+    """Process a single Firestore collection (users or temps)"""
+    count = 0
+    last_doc = None
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Migrate data from Firestore to Supabase PostgreSQL"
-    )
-    parser.add_argument(
-        '--collection',
-        type=str,
-        required=True,
-        help='The Firestore collection to migrate (users or temps)'
-    )
-    parser.add_argument(
-        '--since',
-        type=str,
-        help='Only migrate records newer than this date (YYYY-MM-DD or timestamp)'
-    )
-    parser.add_argument(
-        '--full-sync',
-        action='store_true',
-        help='Migrate all records regardless of timestamp'
-    )
-    parser.add_argument(
-        '--page-size',
-        type=int,
-        default=DEFAULT_PAGE_SIZE,
-        help=f'Number of user documents to process at once (default: {DEFAULT_PAGE_SIZE})'
-    )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Count records without actually migrating them'
-    )
-    parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-        default='INFO',
-        help='Set the logging level'
-    )
-    parser.add_argument(
-        '--http',
-        action='store_true',
-        help='Run as HTTP server instead of CLI'
-    )
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=5000,
-        help='Port for HTTP server (default: 5000)'
-    )
-
-    return parser.parse_args()
-
-
-@app.route('/run', methods=['GET', 'POST'])
-def run_migration():
-    """HTTP endpoint to trigger migration."""
     try:
-        # Get parameters from query string or JSON body
-        if request.method == 'GET':
-            migration_type = request.args.get('type', 'incremental')
-            collection = request.args.get('collection', 'users')
-            dry_run = request.args.get('dry_run', 'false').lower() == 'true'
-        else:
-            data = request.get_json() or {}
-            migration_type = data.get('type', 'incremental')
-            collection = data.get('collection', 'users')
-            dry_run = data.get('dry_run', False)
+        # Get all documents from the collection
+        collection_ref = fs_db.collection(collection_name)
         
-        # Validate collection
-        if collection not in COLLECTIONS_TO_MIGRATE:
-            return jsonify({
-                'status': 'error',
-                'message': f'Invalid collection: {collection}. Must be one of {COLLECTIONS_TO_MIGRATE}'
-            }), 400
+        while True:
+            # Get a page of documents
+            query = collection_ref.limit(page_size)
+            if last_doc:
+                query = query.start_after(last_doc)
+            
+            docs = query.stream()
+            docs_list = list(docs)
+            
+            if not docs_list:
+                break
+            
+            for doc in docs_list:
+                user_id = doc.id
+                last_doc = doc
+                user_data = doc.to_dict()
+                
+                # Process all records for this user
+                user_count = process_user_records(conn, cur, collection_name, user_id, user_data, since, full_sync)
+                count += user_count
+                
+                # Check if we've reached the limit
+                if limit and count >= limit:
+                    break
+            
+            if limit and count >= limit:
+                break
         
-        # Determine since date based on migration type
-        since_date = None
-        if migration_type == 'incremental':
-            logger.info("Running incremental migration")
-            since_date = get_last_execution_from_db()
-            if since_date:
-                logger.info(f"Using last execution time from DB: {since_date.isoformat()}")
-            else:
-                logger.info("No prior execution time found; will process all records")
-        
-        # Run migration
-        start_time = time.time()
-        processed, migrated = migrate_all_to_users_history(
-            collection=collection,
-            since=since_date,
-            full_sync=(migration_type == 'full'),
-            dry_run=dry_run
-        )
-        
-        # Update last execution time if not dry run
-        if not dry_run and migrated > 0:
-            set_last_execution_in_db(datetime.now(pytz.UTC))
-        
-        execution_time = time.time() - start_time
-        
-        return jsonify({
-            'status': 'success',
-            'collection': collection,
-            'type': migration_type,
-            'dry_run': dry_run,
-            'processed': processed,
-            'migrated': migrated,
-            'execution_time_seconds': round(execution_time, 2)
-        })
+        return count
         
     except Exception as e:
-        logger.error(f"HTTP migration failed: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({'status': 'healthy'})
-
-
-def main():
-    """Main entry point for the migration script."""
-    # Load environment variables
-    load_dotenv()
-    
-    # Parse command line arguments
-    args = parse_args()
-    
-    # Set logging level
-    logger.setLevel(args.log_level)
-    
-    # Run as HTTP server if requested
-    if args.http:
-        logger.info(f"Starting HTTP server on port {args.port}")
-        app.run(host='0.0.0.0', port=args.port)
-        return
-    
-    # Parse since date if provided
-    since_date = None
-    if args.since:
-        try:
-            # Try to parse as timestamp (seconds or milliseconds)
-            val = float(args.since)
-            # assume seconds if reasonable magnitude, otherwise ms
-            if val > 1e12:
-                since_date = datetime.fromtimestamp(val / 1000.0, tz=BANGKOK_TZ)
-            else:
-                since_date = datetime.fromtimestamp(val, tz=BANGKOK_TZ)
-        except ValueError:
-            try:
-                # Try to parse as date string YYYY-MM-DD
-                since_date = datetime.strptime(args.since, '%Y-%m-%d').replace(tzinfo=BANGKOK_TZ)
-            except ValueError as e:
-                logger.error(f"Invalid date format for --since: {args.since}")
-                raise
-
-    # If no --since provided, try to read last execution from DB (incremental)
-    if since_date is None and not args.full_sync:
-        logger.info("No --since provided; attempting to read last execution time from migration_status table.")
-        last_exec = get_last_execution_from_db()
-        if last_exec:
-            since_date = last_exec
-            logger.info(f"Using last execution time from DB: {since_date.isoformat()}")
-        else:
-            logger.info("No prior execution time found; running full scan (or use --since to restrict).")
-
-    
-    logger.info("Starting migration process")
-    logger.info(f"Arguments: {vars(args)}")
-    if since_date:
-        logger.info(f"Only migrating records since: {since_date}")
-    
-    start_time = time.time()
-    
-    try:
-        processed, migrated = migrate_all_to_users_history(
-            collection=args.collection,
-            since=since_date,
-            full_sync=args.full_sync,
-            page_size=args.page_size,
-            dry_run=args.dry_run
-        )
-
-        # Update last execution time if not dry run
-        if not args.dry_run and migrated > 0:
-            ok = set_last_execution_in_db(datetime.now(pytz.UTC))
-            if not ok:
-                logger.warning("Migration finished but failed to update migration_status.last_execution_time_history")
-
-        logger.info(
-            f"Migration completed in {time.time() - start_time:.2f} seconds. "
-            f"Processed: {processed}, Migrated: {migrated}"
-        )
-
-        
-    except Exception as e:
-        logger.critical(f"Migration failed after {time.time() - start_time:.2f} seconds: {str(e)}")
+        logger.error(f"Error processing collection {collection_name}: {str(e)}")
         raise
 
+def process_user_records(conn, cur, collection_name, user_id, user_data, since, full_sync):
+    """Process all records for a specific user"""
+    count = 0
+    
+    try:
+        # Get all records for this user
+        records_ref = fs_db.collection(collection_name).document(user_id).collection("records")
+        
+        # Apply timestamp filter if this is an incremental sync
+        if not full_sync and since:
+            records_query = records_ref.where("timestamp", ">=", since.astimezone(pytz.UTC))
+        else:
+            records_query = records_ref
+        
+        all_records = list(records_query.stream())
+        
+        if not all_records:
+            return 0
+        
+        # Group records by recorder
+        grouped_records = {}
+        for rec in all_records:
+            data = rec.to_dict()
+            recorder = data.get("recorder") or "unknown"
+            timestamp = parse_ts(data.get("timestamp")) or datetime.min.replace(tzinfo=pytz.UTC)
+            
+            grouped_records.setdefault(recorder, []).append({
+                'timestamp': timestamp,
+                'id': rec.id,
+                'data': data
+            })
+        
+        # Build batch rows and insert using execute_values
+        rows_to_insert = []
+        for recorder, records in grouped_records.items():
+            try:
+                # Sort by timestamp (newest first)
+                records.sort(key=lambda x: x['timestamp'], reverse=True)
+                
+                # Find the record with risk prediction, or fallback to newest
+                record_with_risk = None
+                for record in records:
+                    prediction = record['data'].get('prediction', {})
+                    if isinstance(prediction, dict) and prediction.get('risk') is not None:
+                        record_with_risk = record
+                        break
+                
+                if not record_with_risk:
+                    record_with_risk = records[0] if records else None
+                
+                if not record_with_risk:
+                    continue
+                
+                # Prepare data for insertion
+                latest_data = record_with_risk['data']
+                prediction = latest_data.get('prediction', {})
+                risk_val = prediction.get('risk') if isinstance(prediction, dict) else None
+                prediction_risk_for_db = str(risk_val) if risk_val is not None else None
+                
+                # Count fields across all records for this recorder
+                field_counts = {field: 0 for field in FIELDS_TO_COUNT}
+                for record in records:
+                    for field in FIELDS_TO_COUNT:
+                        if record['data'].get(field) is not None:
+                            field_counts[field] += 1
+                
+                row = [
+                    user_id,
+                    recorder,
+                    record_with_risk['id'],
+                    latest_data.get('version'),
+                    record_with_risk['timestamp'],
+                    prediction_risk_for_db,
+                    len(records)
+                ] + [field_counts[f] for f in FIELDS_TO_COUNT]
+                rows_to_insert.append(tuple(row))
+                
+            except Exception as e:
+                logger.error(f"Error preparing recorder {recorder} for user {user_id}: {str(e)}")
+                conn.rollback()
+        
+        if rows_to_insert:
+            try:
+                columns = "user_id, recorder, record_id, version, last_update, prediction_risk, record_count, " + ", ".join(FIELDS_TO_COUNT)
+                placeholders = ", ".join(["%s"] * (7 + len(FIELDS_TO_COUNT)))
+                sql = f"INSERT INTO users_history ({columns}) VALUES %s ON CONFLICT (user_id, recorder, record_id) DO NOTHING"
+                execute_values(cur, sql, rows_to_insert, template=f"({placeholders})")
+                count += len(rows_to_insert)
+                conn.commit()
+                logger.info(f"Committed {count} summaries so far...")
+            except Exception as e:
+                logger.error(f"Error executing batch insert for user {user_id}: {str(e)}")
+                conn.rollback()
+        
+        return count
+        
+    except Exception as e:
+        logger.error(f"Error processing user {user_id}: {str(e)}")
+        raise
 
+# --- Flask Routes ---
+@app.route("/")
+def index():
+    """Renders the main migration console dashboard."""
+    next_scheduled_run = schedule.next_run()
+    
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Firebase-Supabase Migration Console (UTC+7)</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f8f8; color: #333; line-height: 1.6;}
+                .card { background: #ffffff; padding: 25px; margin: 20px 0; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+                h1, h2 { color: #2c3e50; margin-top: 0;}
+                .status-info p { margin: 5px 0; }
+                .status-info strong { color: #007bff; }
+                .thai-time { font-weight: bold; color: #0066cc; }
+                .button-group { margin-top: 20px; text-align: center; }
+                .button { 
+                    background: #28a745;
+                    color: white; 
+                    border: none; 
+                    padding: 12px 20px; 
+                    margin: 8px; 
+                    border-radius: 6px; 
+                    cursor: pointer; 
+                    text-decoration: none; 
+                    display: inline-block;
+                    font-size: 1rem;
+                    transition: background-color 0.3s ease, transform 0.2s ease;
+                }
+                .button:hover { 
+                    background-color: #218838; 
+                    transform: translateY(-2px);
+                }
+                .button.full { 
+                    background: #dc3545;
+                }
+                .button.full:hover { 
+                    background-color: #c82333;
+                }
+                .history-section { margin-top: 30px; }
+                .history-item { 
+                    background: #f0f0f0; 
+                    padding: 15px; 
+                    margin-bottom: 10px; 
+                    border-radius: 5px; 
+                    border-left: 5px solid;
+                }
+                .history-item.success { border-color: #28a745; }
+                .history-item.failed { border-color: #dc3545; }
+                .history-item p { margin: 3px 0; }
+                .history-item strong { color: #495057; }
+                .success-text { color: #28a745; font-weight: bold; }
+                .failed-text { color: #dc3545; font-weight: bold; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>Firebase to Supabase Migration (ไทยเวลา UTC+7)</h1>
+                <div class="status-info">
+                    <p>สถานะ: <strong>{{ 'กำลังทำงาน' if is_running else 'พร้อมทำงาน' }}</strong></p>
+                    <p>เวลาปัจจุบัน: <span class="thai-time">{{ now }}</span></p>
+                    <p>การดำเนินการล่าสุด: <span class="thai-time">{{ last }}</span></p>
+                    <p>การดำเนินการถัดไป (ในแอป): <span class="thai-time">{{ next }}</span></p>
+                    <p><em>(การตั้งเวลาอัตโนมัติบน Render ต้องใช้ Cron Jobs ภายนอก)</em></p>
+                </div>
+                
+                <form method="post" action="/run" class="button-group">
+                    <button class="button" type="submit" name="type" value="incremental">ซิงค์เฉพาะข้อมูลใหม่</button>
+                    <button class="button full" type="submit" name="type" value="full">ซิงค์ข้อมูลทั้งหมด</button>
+                </form>
+                
+                <div class="test-form">
+                    <form method="post" action="/test" class="button-group">
+                        <label for="record_count">ทดสอบการซิงค์ (จำนวนเรคคอร์ด):</label>
+                        <input type="number" id="record_count" name="record_count" min="1" max="1000" value="10">
+                        <button class="button test" type="submit">ทดสอบการซิงค์</button>
+                    </form>
+                </div>
+            </div>
+            
+            <div class="card history-section">
+                <h2>ประวัติการทำงานล่าสุด</h2>
+                {% if history %}
+                    {% for entry in history %}
+                    <div class="history-item {{ 'success' if 'success' in entry.status else 'failed' }}">
+                        <p><strong>{{ 'ซิงค์ทั้งหมด' if entry.type == 'full' else 'ซิงค์เฉพาะใหม่' }}</strong></p>
+                        <p>เริ่มต้น: <span class="thai-time">{{ entry.start_time }}</span></p>
+                        <p>สิ้นสุด: <span class="thai-time">{{ entry.end_time }}</span></p>
+                        <p>สถานะ: <span class="{{ 'success-text' if 'success' in entry.status else 'failed-text' }}">
+                            {{ entry.status }}
+                        </span></p>
+                        <p>สรุปข้อมูลที่ประมวลผล: {{ entry.summary_count }}</p>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <p>ยังไม่มีประวัติการทำงาน</p>
+                {% endif %}
+            </div>
+        </body>
+        </html>
+    """, 
+    now=format_dt(now_thai()),
+    last=format_dt(last_execution),
+    next=format_dt(next_scheduled_run) if next_scheduled_run else "ไม่ได้กำหนด/ปิดใช้งาน",
+    is_running=is_running,
+    history=execution_history[::-1]
+    )
+
+@app.route("/test", methods=["POST"])
+def trigger_test_migration():
+    """Endpoint to manually trigger a test migration."""
+    try:
+        record_count = int(request.form.get("record_count", 10))
+        record_count = max(1, min(1000, record_count))
+    except ValueError:
+        record_count = 10
+        
+    logger.info(f"Manual test trigger for {record_count} records received.")
+    
+    thread = threading.Thread(target=lambda: test_migration(record_count=record_count))
+    thread.daemon = True
+    thread.start()
+    
+    return redirect(url_for("index"))
+
+@app.route("/run", methods=["POST"])
+def trigger_migration():
+    """Endpoint to manually trigger a migration."""
+    migration_type = request.form.get("type", "incremental")
+    full_sync = (migration_type == "full")
+    logger.info(f"Manual trigger for {migration_type} sync received.")
+    
+    thread = threading.Thread(target=lambda: migrate_all(full_sync=full_sync))
+    thread.daemon = True
+    thread.start()
+    
+    return redirect(url_for("index"))
+
+@app.route("/api/status")
+def api_status():
+    """API endpoint to get the current status of the migration."""
+    next_scheduled_run = schedule.next_run()
+    return jsonify({
+        "status": "running" if is_running else "idle",
+        "timezone": "Asia/Bangkok (UTC+7)",
+        "current_time": format_dt(now_thai()),
+        "last_execution": format_dt(last_execution),
+        "next_scheduled_in_app": format_dt(next_scheduled_run) if next_scheduled_run else None,
+        "execution_history": [
+            {
+                "type": h["type"],
+                "start_time": format_dt(h["start_time"]),
+                "end_time": format_dt(h["end_time"]),
+                "summary_count": h["summary_count"],
+                "status": h["status"]
+            } for h in execution_history[::-1]
+        ]
+    })
+
+# --- Scheduler Setup ---
+def schedule_jobs():
+    """Configures and runs the in-app scheduler."""
+    schedule.every().sunday.at("00:00", BANGKOK_TZ).do(lambda: migrate_all(full_sync=True)).tag("weekly")
+    schedule.every().day.at("03:00", BANGKOK_TZ).do(lambda: migrate_all(full_sync=False)).tag("daily")
+    
+    logger.info("In-app scheduler started. Checking for pending jobs every 30 seconds.")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+# --- Application Entry Point ---
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 7860))
+    last_execution = get_last_execution_from_db()
+
+    if os.getenv('RENDER'):
+        logger.info("Detected RENDER environment. Running Flask app without in-app scheduler thread.")
+        app.run(host="0.0.0.0", port=port)
+    else:
+        logger.info("Running in local development environment. Starting Flask app with in-app scheduler.")
+        threading.Thread(target=schedule_jobs, daemon=True).start()
+        app.run(host="0.0.0.0", port=port)
